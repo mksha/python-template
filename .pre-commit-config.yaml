@@ -14,3 +14,14 @@ repos:
       - id: ruff          # linter
         args: [--fix]
       - id: ruff-format   # formatter
+  # mypy runs via `local` so it uses your project's venv and sees all
+  # dependencies + type stubs. The mirrors-mypy repo runs in isolation
+  # and misses imports — this approach is more reliable for real projects.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false    # let mypy use [tool.mypy] config from pyproject.toml
