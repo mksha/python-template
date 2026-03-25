@@ -1,0 +1,45 @@
+# ── hatch-vcs generated version ──
+src/my_package/_version.py
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# ── Virtual environments ──
+.venv/
+venv/
+
+# ── uv ──
+# Keep uv.lock tracked (recommended), but ignore local caches
+.uv/
+
+# ── Testing / Coverage ──
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# ── Type checking ──
+.mypy_cache/
+
+# ── Ruff ──
+.ruff_cache/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Environment variables ──
+.env
+.env.local

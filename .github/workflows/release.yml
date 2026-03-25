@@ -1,0 +1,250 @@
+# ============================================================================
+# Python Package Release Workflow  (uv + hatchling + hatch-vcs)
+# ============================================================================
+#
+# Versioning is handled by hatch-vcs (setuptools-scm under the hood).
+# It reads the version from git state automatically:
+#
+#   1. DEV RELEASE     — push to any feature branch (no tag needed)
+#                        version: x.y.z.devN+gSHA  (git distance from last tag)
+#                        target:  TestPyPI
+#
+#   2. PRE-RELEASE     — push tag vX.Y.ZrcN on main
+#                        version: X.Y.ZrcN
+#                        target:  PyPI
+#
+#   3. STABLE RELEASE  — push tag vX.Y.Z on main
+#                        version: X.Y.Z
+#                        target:  PyPI
+#
+# Required setup:
+#   - pyproject.toml configured with hatchling + hatch-vcs  (see sample)
+#   - GitHub Environments: "testpypi" and "pypi"
+#   - Trusted Publishing configured on TestPyPI and PyPI
+# ============================================================================
+
+name: Release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── Classify the release type ─────────────────────────────────────────────
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      release_type: ${{ steps.classify.outputs.release_type }}
+      version:      ${{ steps.classify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # full history — hatch-vcs needs tags + depth
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Classify release
+        id: classify
+        run: |
+          REF="${GITHUB_REF}"
+
+          # ── Tagged push ──────────────────────────────────────────────
+          if [[ "$REF" == refs/tags/v* ]]; then
+            TAG="${REF#refs/tags/v}"
+
+            # Tag must be on main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main 2>/dev/null; then
+              echo "::error::Release tags must be on the main branch."
+              exit 1
+            fi
+
+            if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+rc[0-9]+$ ]]; then
+              echo "release_type=prerelease" >> "$GITHUB_OUTPUT"
+              echo "version=${TAG}"          >> "$GITHUB_OUTPUT"
+
+            elif [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "release_type=stable" >> "$GITHUB_OUTPUT"
+              echo "version=${TAG}"      >> "$GITHUB_OUTPUT"
+
+            else
+              echo "::error::Tag format not recognised: v${TAG}"
+              exit 1
+            fi
+
+          # ── Feature branch push (no tag) → dev release ──────────────
+          elif [[ "$REF" == refs/heads/* ]]; then
+            BRANCH="${REF#refs/heads/}"
+
+            # main without a tag — nothing to do
+            if [[ "$BRANCH" == "main" ]]; then
+              echo "release_type=skip" >> "$GITHUB_OUTPUT"
+              echo "version="          >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # hatch-vcs computes: {last_tag}.devN+gSHA
+            # If no tags exist yet, falls back to 0.1.0.devN
+            #
+            # NOTE: The base version (e.g. 1.2.4 in 1.2.4.dev5) is always a
+            # patch bump from the last tag. This is cosmetic — dev builds are
+            # ephemeral test artifacts on TestPyPI. The real version (minor,
+            # major, RC) is decided when you create the tag on main.
+            DEV_VERSION=$(uvx --from hatch hatch version)
+            echo "release_type=dev"          >> "$GITHUB_OUTPUT"
+            echo "version=${DEV_VERSION}"    >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        run: |
+          echo "### Release classification" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Type    | \`${{ steps.classify.outputs.release_type }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Version | \`${{ steps.classify.outputs.version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Run tests ─────────────────────────────────────────────────────────────
+  test:
+    needs: resolve
+    if: needs.resolve.outputs.release_type != 'skip'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install project + dev deps
+        run: uv sync --python ${{ matrix.python-version }} --extra dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        run: uv run pytest --tb=short -q
+
+  # ── Build the distribution ────────────────────────────────────────────────
+  build:
+    needs: [resolve, test]
+    if: needs.resolve.outputs.release_type != 'skip'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      # SETUPTOOLS_SCM_PRETEND_VERSION pins the version to exactly what
+      # the resolve job computed, guarding against git-state drift between jobs.
+      - name: Build sdist + wheel
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.resolve.outputs.version }}
+        run: uv build
+
+      - name: Verify package version
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          WHEEL=$(ls dist/*.whl)
+          echo "Built: ${WHEEL}"
+
+          # Wheel filenames strip the +local part and normalise separators
+          EXPECTED=$(echo "${RELEASE_VERSION}" | sed 's/+.*//' | tr '-' '_')
+          if [[ "$WHEEL" != *"$EXPECTED"* ]]; then
+            echo "::error::Wheel does not contain expected version '${EXPECTED}'"
+            echo "::error::Wheel filename: ${WHEEL}"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # ── Publish: dev → TestPyPI ───────────────────────────────────────────────
+  publish-dev:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.release_type == 'dev'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  # ── Publish: pre-release / stable → PyPI ──────────────────────────────────
+  publish-pypi:
+    needs: [resolve, build]
+    if: >-
+      needs.resolve.outputs.release_type == 'prerelease' ||
+      needs.resolve.outputs.release_type == 'stable'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ── GitHub Release (stable only) ──────────────────────────────────────────
+  github-release:
+    needs: [resolve, publish-pypi]
+    if: needs.resolve.outputs.release_type == 'stable'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" dist/* \
+            --title "v${VERSION}" \
+            --generate-notes
